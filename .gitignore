@@ -1,0 +1,7 @@
+torchlight_crawler
+*.o
+*.out
+
+*.swp
+*.swo
+.DS_Stor
