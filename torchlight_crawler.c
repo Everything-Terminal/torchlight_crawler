@@ -11,9 +11,20 @@
 #include <signal.h>
 #include <stdarg.h>
 
-#define MAP_W 60
-#define MAP_H 20
-#define MAX_ACTORS 32
+/* Map is generated fresh each run at a random size within these bounds,
+ * and displayed through a fixed-size scrolling viewport centered on the
+ * player. This is why "map" (full generated dungeon) and "view" (what's
+ * actually drawn to the terminal) are different sizes throughout. */
+#define MAP_MAXW 120
+#define MAP_MAXH 44
+#define MAP_MINW 80
+#define MAP_MINH 28
+
+#define VIEW_W 60
+#define VIEW_H 20
+
+#define MAX_ROOMS 20
+#define MAX_ACTORS 96
 #define TORCH_RADIUS 6.5f
 
 #define RESET         "\033[0m"
@@ -31,6 +42,10 @@ typedef struct {
     char ch;
     int r, g, b;
 } Actor;
+
+typedef struct {
+    int x, y, w, h;
+} Room;
 
 /* Terminal & Global State */
 
@@ -62,57 +77,98 @@ static int clamp255(int v) {
     return v;
 }
 
+static int clampi(int v, int lo, int hi) {
+    if (v < lo) return lo;
+    if (v > hi) return hi;
+    return v;
+}
+
 /* Map & Actors */
 
-const char *level_strings[MAP_H] = {
-    "############################################################",
-    "#.@........................................................#",
-    "#....########.....................########.................#",
-    "#....#......#...................#......#...................#",
-    "#....#......#........g..........#......#...................#",
-    "#....########...................########...................#",
-    "#..........................................................#",
-    "#...........g.................................!............#",
-    "#..........................................................#",
-    "#...............................g..........................#",
-    "#..........................................................#",
-    "#.....!....................................................#",
-    "#..........................................................#",
-    "#...........########..........................########.....#",
-    "#...........#......#..........................#......#.....#",
-    "#...........#......#..........................#......#.....#",
-    "#...........########..........................########.....#",
-    "#..........................................................#",
-    "#....................................................*.....#",
-    "############################################################"
-};
+char map[MAP_MAXH][MAP_MAXW];
+int map_w = 0, map_h = 0;
 
-char map[MAP_H][MAP_W];
+Room rooms[MAX_ROOMS];
+int room_count  = 0;
+
 Actor actors[MAX_ACTORS];
 int actor_count = 0;
 Actor *player = NULL;
 
-void init_game(void) {
-    actor_count = 0;
-    for (int y = 0; y < MAP_H; y++) {
-        for (int x = 0; x < MAP_W; x++) {
-            char c = level_strings[y][x];
-            map[y][x] = c;
+static void room_center(const Room *r, int *cx, int *cy) {
+    *cx = r->x + r->w / 2;
+    *cy = r->y + r->h / 2;
+}
 
-            if (c == '@' || c == 'g' || c == '!' || c == '*') {
-                Actor a = {0};
-                a.x = x;
-                a.y = y;
-                if (c == '@') { a.type = ACTOR_PLAYER; a.hp = 10; a.ch = '@'; a.r = 255; a.g = 255; a.b = 150; player = &actors[actor_count]; }
-                else if (c == 'g') { a.type = ACTOR_GOBLIN; a.hp = 3; a.ch = 'g'; a.r = 180; a.g = 40;  a.b = 40; }
-                else if (c == '!') { a.type = ACTOR_POTION; a.hp = 1; a.ch = '!'; a.r = 255; a.g = 100; a.b = 200; }
-                else if (c == '*') { a.type = ACTOR_AMULET; a.hp = 1; a.ch = '*'; a.r = 100; a.g = 255; a.b = 255; }
+static int rooms_overlap(const Room *a, const Room *b) {
+    /* Padding of 1 tile so rooms never end up wall-to-wall. */
+    return !(a->x + a->w + 1 <= b->x || b->x + b->w + 1 <= a->x ||
+              a->y + a->h + 1 <= b->y || b->y + b->h + 1 <= a->y);
+}
 
-                actors[actor_count++] = a;
-                map[y][x] = '.';
+static void carve_room(const Room *r) {
+    for (int y = r->y; y < r->y + r->h; y++)
+        for (int x = r->x; x < r->x + r->w; x++)
+            map[y][x] = '.';
+}
+
+static void carve_h_corridor(int x1, int x2, int y) {
+    int lo = x1 < x2 ? x1 : x2;
+    int hi = x1 < x2 ? x2 : x1;
+    for (int x = lo; x <= hi; x++) map[y][x] = '.';
+}
+
+static void carve_v_corridor(int y1, int y2, int x) {
+    int lo = y1 < y2 ? y1 : y2;
+    int hi = y1 < y2 ? y2 : y1;
+    for (int y = lo; y <= hi; y++) map[y][x] = '.';
+}
+
+/* Carves a random dungeon of rooms connected by L-shaped corridors into
+ * map[][], picking a fresh random size each call. Retries the whole
+ * layout if room placement got unlucky and produced too few rooms. */
+static void generate_dungeon(void) {
+    do {
+        map_w = MAP_MINW + rand() % (MAP_MAXW - MAP_MINW + 1);
+        map_h = MAP_MINH + rand() % (MAP_MAXH - MAP_MINH + 1);
+
+        for (int y = 0; y < map_h; y++)
+            for (int x = 0; x < map_w; x++)
+                map[y][x] = '#';
+
+        room_count = 0;
+        int tries = 0;
+        while (room_count < MAX_ROOMS && tries < 400) {
+            tries++;
+            int w = 4 + rand() % 7;
+            int h = 3 + rand() % 4;
+            int x = 1 + rand() % (map_w - w - 2);
+            int y = 1 + rand() % (map_h - h - 2);
+            Room r = { x, y, w, h};
+
+            int ok = 1;
+            for (int i = 0; i < room_count; i++) {
+                if (rooms_overlap(&r, &rooms[i])) { ok = 0; break; }
+            }
+            if (!ok) continue;
+
+            rooms[room_count++] = r;
+            carve_room(&r);
+
+            if (room_count > 1) {
+                int cx1, cy1, cx2, cy2;
+                room_center(&rooms[room_count - 2], &cx1, &cy1);
+                room_center(&rooms[room_count - 1], &cx2, &cy2);
+                if (rand() % 2) {
+                    carve_h_corridor(cx1, cx2, cy1);
+                    carve_v_corridor(cy1, cy2, cx2);
+                } else {
+                    carve_v_corridor(cy1, cy2, cx1);
+                    carve_h_corridor(cx1, cx2, cy2);
+                }
             }
         }
-    }
+    } while (room_count < 4);
 }
 
 Actor* get_actor_at(int x, int y) {
@@ -122,6 +178,69 @@ Actor* get_actor_at(int x, int y) {
     return NULL;
 }
 
+static Actor* spawn_actor(ActorType type, int x, int y, int hp, char ch, int r, int g, int b) {
+    if (actor_count >= MAX_ACTORS) return NULL;
+    Actor *a = &actors[actor_count++];
+    a->type = type;
+    a->x = x; a->y = y;
+    a->hp = hp;
+    a->ch = ch;
+    a->r = r; a->g = g; a->b = b;
+    return a;
+}
+
+/* Finds a free floor tile inside room i (not on its outer edge, and not
+ * already occupied by another actor). Falls back to the room's center
+ * if it can't find one quickly, so placement never fails outright. */
+static void free_spot_in_room(int room_idx, int *ox, int *oy) {
+    const Room *r = &rooms[room_idx];
+    for (int tries = 0; tries < 20; tries++) {
+        int x = r->x + 1 + rand() % (r->w > 2 ? r->w - 2 : 1);
+        int y = r->y + 1 + rand() % (r->h > 2 ? r->h - 2 : 1);
+        if (!get_actor_at(x, y)) { *ox = x; *oy = y; return; }
+    }
+    room_center(r, ox, oy);
+}
+
+void init_game(void) {
+    generate_dungeon();
+    actor_count = 0;
+    player = NULL;
+
+    int px, py;
+    room_center(&rooms[0], &px, &py);
+    player = spawn_actor(ACTOR_PLAYER, px, py, 10, '@', 255, 255, 150);
+
+    /* Amulet goes in whichever room is farthest from the start, so it's
+     * always a real trek across the generated dungeon. */
+    int farthest = 1, farthest_d2 = -1;
+    for (int i = 1; i < room_count; i++) {
+        int cx, cy;
+        room_center(&rooms[i], &cx, &cy);
+        int dx = cx - px, dy = cy - py;
+        int d2 = dx * dx + dy * dy;
+        if (d2 > farthest_d2) { farthest_d2 = d2; farthest = i; }
+    }
+    int ax, ay;
+    free_spot_in_room(farthest, &ax, &ay);
+    spawn_actor(ACTOR_AMULET, ax, ay, 1, '*', 100, 255, 255);
+
+    int potion_count = clampi(2 + room_count / 5, 2, 6);
+    for (int i = 0; i < potion_count; i++) {
+        int ridx = 1 + rand() % (room_count - 1);
+        int x, y;
+        free_spot_in_room(ridx, &x, &y);
+        if (!get_actor_at(x, y)) spawn_actor(ACTOR_POTION, x, y, 1, '!', 255, 100, 200);
+    }
+    int goblin_count = clampi(room_count + rand() % 4, 4, MAX_ACTORS - actor_count - 1);
+    for (int i = 0; i < goblin_count; i++) {
+        int ridx = 1 + rand() % (room_count - 1);
+        int x, y;
+        free_spot_in_room(ridx, &x, &y);
+        if (!get_actor_at(x, y)) spawn_actor(ACTOR_GOBLIN, x, y, 3, 'g', 180, 40, 40);
+    }
+}
+
 /* Game Logic */
 
 void try_move_player(int dx, int dy) {
@@ -129,7 +248,7 @@ void try_move_player(int dx, int dy) {
     int nx = player->x + dx;
     int ny = player->y + dy;
 
-    if (nx < 0 || nx >= MAP_W || ny < 0 || ny >= MAP_H) return;
+    if (nx < 0 || nx >= map_w || ny < 0 || ny >= map_h) return;
     if (map[ny][nx] == '#') return;
 
     Actor *target = get_actor_at(nx, ny);
@@ -181,7 +300,7 @@ void enemy_turn(void) {
         int nx = a->x + mx;
         int ny = a->y + my;
 
-        if (nx < 0 || nx >= MAP_W || ny < 0 || ny >= MAP_H) continue;
+        if (nx < 0 || nx >= map_w || ny < 0 || ny >= map_h) continue;
         if (map[ny][nx] != '#' && !get_actor_at(nx, ny)) {
             a->x = nx;
             a->y = ny;
@@ -192,8 +311,8 @@ void enemy_turn(void) {
 /* Rendering */
 
 /* Buffer sized with headroom: worst case is one truecolor escape
- * sequence (~20 bytes) per map cell plus the HUD/footer text. */
-#define RENDER_BUF_SIZE (MAP_W * MAP_H * 24 + 4096)
+ * sequece (~20 bytes) per visible viewport cell plus the HUD/footer text. */
+#define RENDER_BUF_SIZE (VIEW_W * VIEW_H * 24 + 4096)
 
 /* Wrapper around snprintf that tracks remaining space and never
  * writes past the end of buf, even if the terminal or map grows. */
@@ -227,16 +346,31 @@ void render(void) {
     }
     buf_append(buf, sizeof(buf), &p, "\033[0m\033[1;38;2;200;200;200m] %s \033[0m\033[K\n", message);
 
-    /* Map */
-    for (int y = 0; y < MAP_H; y++) {
-        for (int x = 0; x < MAP_W; x++) {
-            char ch = map[y][x];
+    /* Camera follows the player, clamped so the viewport never scrolls
+     * past the edges of the generated map. */
+    int cam_x = clampi(player->x - VIEW_W / 2, 0, map_w - VIEW_W);
+    int cam_y = clampi(player->y - VIEW_H / 2, 0, map_h - VIEW_H);
+    if (map_w <= VIEW_W) cam_x = 0;
+    if (map_h <= VIEW_H) cam_y = 0;
+
+    /* Map viewport */
+    for (int vy = 0; vy < VIEW_H; vy++) {
+        int wy = cam_y + vy;
+        for (int vx = 0; vx < VIEW_W; vx++) {
+            int wx = cam_x + vx;
+
+            if (wx >= map_w || wy >= map_h) {
+                buf_append(buf, sizeof(buf), &p, " ");
+                continue;
+            }
+
+            char ch = map[wy][wx];
             int r = 40, g = 40, b = 45;
 
             if (ch == '#') { r = 80; g = 80; b = 90; }
             else { r = 30; g = 25; b = 20; }
 
-            Actor *a = get_actor_at(x, y);
+            Actor *a = get_actor_at(wx, wy);
             if (a) {
                 ch = a->ch;
                 r = a->r;
@@ -246,8 +380,8 @@ void render(void) {
 
             float light = 0.0f;
             if (player) {
-                float dx = (float)(x - player->x);
-                float dy = (float)(y - player->y);
+                float dx = (float)(wx - player->x);
+                float dy = (float)(wy - player->y);
                 float dist = sqrtf(dx * dx + dy * dy);
                 light = 1.0f - (dist / (TORCH_RADIUS * flicker));
                 if (light < 0.0f) light = 0.0f;
@@ -355,7 +489,3 @@ int main(void) {
     printf("Thanks for playing Torchlight Crawler!\n");
     return 0;
 }
-
-
-
-
