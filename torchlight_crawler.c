@@ -33,7 +33,7 @@
 #define HIDE_CURSOR   "\033[?25l"
 #define SHOW_CURSOR   "\033[?25h"
 
-typedef enum { ACTOR_NONE, ACTOR_PLAYER, ACTOR_GOBLIN, ACTOR_POTION, ACTOR_AMULET } ActorType;
+typedef enum { ACTOR_NONE, ACTOR_PLAYER, ACTOR_GOBLIN, ACTOR_POTION, ACTOR_AMULET, ACTOR_WEAPON } ActorType;
 
 typedef struct {
     ActorType type;
@@ -41,6 +41,7 @@ typedef struct {
     int hp;
     char ch;
     int r, g, b;
+    int power; /* Attack damage: player's current weapon, or a weapon pickup's value */
 } Actor;
 
 typedef struct {
@@ -81,6 +82,24 @@ static int clampi(int v, int lo, int hi) {
     if (v < lo) return lo;
     if (v > hi) return hi;
     return v;
+}
+
+/* Weapon pickups: a fixed small set of increasingly powerful weapons.
+ * A weapon's "power" is both its damage value and its unique lookup key. */
+typedef struct { const char *name; int power; int r, g, b; } WeaponDef;
+static const WeaponDef WEAPON_DEFS[] = {
+    { "dagger", 2, 200, 200, 200 },
+    { "sword",  3, 180, 180, 255 },
+    { "axe",    4, 255, 140, 60  },
+};
+#define WEAPON_DEF_COUNT (int)(sizeof(WEAPON_DEFS) / sizeof(WEAPON_DEFS[0]))
+
+static const char* weapon_name_for_power(int power) {
+    if (power <= 1) return "fists";
+    for (int i = 0; i < WEAPON_DEF_COUNT; i++) {
+        if (WEAPON_DEFS[i].power == power) return WEAPON_DEFS[i].name;
+    }
+    return "weapon";
 }
 
 /* Map & Actors */
@@ -178,7 +197,7 @@ Actor* get_actor_at(int x, int y) {
     return NULL;
 }
 
-static Actor* spawn_actor(ActorType type, int x, int y, int hp, char ch, int r, int g, int b) {
+static Actor* spawn_actor(ActorType type, int x, int y, int hp, char ch, int r, int g, int b, int power) {
     if (actor_count >= MAX_ACTORS) return NULL;
     Actor *a = &actors[actor_count++];
     a->type = type;
@@ -186,6 +205,7 @@ static Actor* spawn_actor(ActorType type, int x, int y, int hp, char ch, int r, 
     a->hp = hp;
     a->ch = ch;
     a->r = r; a->g = g; a->b = b;
+    a->power = power;
     return a;
 }
 
@@ -209,7 +229,7 @@ void init_game(void) {
 
     int px, py;
     room_center(&rooms[0], &px, &py);
-    player = spawn_actor(ACTOR_PLAYER, px, py, 10, '@', 255, 255, 150);
+    player = spawn_actor(ACTOR_PLAYER, px, py, 10, '@', 255, 255, 150, 1);
 
     /* Amulet goes in whichever room is farthest from the start, so it's
      * always a real trek across the generated dungeon. */
@@ -223,21 +243,32 @@ void init_game(void) {
     }
     int ax, ay;
     free_spot_in_room(farthest, &ax, &ay);
-    spawn_actor(ACTOR_AMULET, ax, ay, 1, '*', 100, 255, 255);
+    spawn_actor(ACTOR_AMULET, ax, ay, 1, '*', 100, 255, 255, 0);
 
     int potion_count = clampi(2 + room_count / 5, 2, 6);
     for (int i = 0; i < potion_count; i++) {
         int ridx = 1 + rand() % (room_count - 1);
         int x, y;
         free_spot_in_room(ridx, &x, &y);
-        if (!get_actor_at(x, y)) spawn_actor(ACTOR_POTION, x, y, 1, '!', 255, 100, 200);
+        if (!get_actor_at(x, y)) spawn_actor(ACTOR_POTION, x, y, 1, '!', 255, 100, 200, 0);
     }
+
+    int weapon_count = clampi(1 + room_count / 6, 1, 4);
+    for (int i = 0; i < weapon_count; i++) {
+        int ridx = 1 + rand() % (room_count - 1);
+        int x, y;
+        free_spot_in_room(ridx, &x, &y);
+        if (get_actor_at(x, y)) continue;
+        const WeaponDef *def = &WEAPON_DEFS[rand() % WEAPON_DEF_COUNT];
+        spawn_actor(ACTOR_WEAPON, x, y, 1, '/', def->r, def->g, def->b, def->power);
+    }
+
     int goblin_count = clampi(room_count + rand() % 4, 4, MAX_ACTORS - actor_count - 1);
     for (int i = 0; i < goblin_count; i++) {
         int ridx = 1 + rand() % (room_count - 1);
         int x, y;
         free_spot_in_room(ridx, &x, &y);
-        if (!get_actor_at(x, y)) spawn_actor(ACTOR_GOBLIN, x, y, 3, 'g', 180, 40, 40);
+        if (!get_actor_at(x, y)) spawn_actor(ACTOR_GOBLIN, x, y, 3, 'g', 180, 40, 40, 0);
     }
 }
 
@@ -254,7 +285,7 @@ void try_move_player(int dx, int dy) {
     Actor *target = get_actor_at(nx, ny);
     if (target) {
         if (target->type == ACTOR_GOBLIN) {
-            target->hp--;
+            target->hp -= player->power;
             if (target->hp <= 0) {
                 snprintf(message, sizeof(message), "You slew the goblin!");
             } else {
@@ -267,6 +298,15 @@ void try_move_player(int dx, int dy) {
         } else if (target->type == ACTOR_AMULET) {
             target->hp = 0;
             snprintf(message, sizeof(message), "YOU FOUND THE AMULET! YOU WIN!");
+        } else if (target->type == ACTOR_WEAPON) {
+            if (target->power > player->power) {
+                player->power = target->power;
+                snprintf(message, sizeof(message), "You wield a %s! (%d dmg)",
+                         weapon_name_for_power(target->power), target->power);
+            } else {
+                snprintf(message, sizeof(message), "You already have a better weapon.");
+            }
+            target->hp = 0;
         }
     } else {
         player->x = nx;
@@ -344,7 +384,9 @@ void render(void) {
         buf_append(buf, sizeof(buf), &p,
             i < player->hp ? "\033[38;2;255;80;80m█" : "\033[38;2;80;20;20m░");
     }
-    buf_append(buf, sizeof(buf), &p, "\033[0m\033[1;38;2;200;200;200m] %s \033[0m\033[K\n", message);
+    buf_append(buf, sizeof(buf), &p,
+        "\033[0m\033[1;38;2;200;200;200m] \033[38;2;180;180;255m[%s %ddmg]\033[38;2;200;200;200m %s \033[0m\033[K\n",
+        weapon_name_for_power(player->power), player->power, message);
 
     /* Camera follows the player, clamped so the viewport never scrolls
      * past the edges of the generated map. */
