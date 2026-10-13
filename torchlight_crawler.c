@@ -33,7 +33,7 @@
 #define HIDE_CURSOR   "\033[?25l"
 #define SHOW_CURSOR   "\033[?25h"
 
-typedef enum { ACTOR_NONE, ACTOR_PLAYER, ACTOR_GOBLIN, ACTOR_POTION, ACTOR_AMULET, ACTOR_WEAPON } ActorType;
+typedef enum { ACTOR_NONE, ACTOR_PLAYER, ACTOR_GOBLIN, ACTOR_RAT, ACTOR_BAT, ACTOR_SKELETON, ACTOR_POTION, ACTOR_AMULET, ACTOR_WEAPON } ActorType;
 
 typedef struct {
     ActorType type;
@@ -82,6 +82,29 @@ static int clampi(int v, int lo, int hi) {
     if (v < lo) return lo;
     if (v > hi) return hi;
     return v;
+}
+
+static int is_enemy(ActorType t) {
+    return t == ACTOR_GOBLIN || t == ACTOR_RAT || t == ACTOR_BAT || t == ACTOR_SKELETON;
+}
+
+static const char* enemy_name(ActorType t) {
+    switch (t) {
+        case ACTOR_GOBLIN:   return "goblin";
+        case ACTOR_RAT:      return "rat";
+        case ACTOR_BAT:      return "bat";
+        case ACTOR_SKELETON: return "skeleton";
+        default:             return "creature";
+    }
+}
+
+/* Picks one of the 4 cardinal directions at random, used for enemies
+ * that move erratically instead of beelining for the player. */
+static void random_cardinal(int *mx, int *my) {
+    static const int dirs[4][2] = { {1,0}, {-1,0}, {0,1}, {0,-1} };
+    int r = rand() % 4;
+    *mx = dirs[r][0];
+    *my = dirs[r][1];
 }
 
 /* Weapon pickups: a fixed small set of increasingly powerful weapons.
@@ -263,12 +286,23 @@ void init_game(void) {
         spawn_actor(ACTOR_WEAPON, x, y, 1, '/', def->r, def->g, def->b, def->power);
     }
 
-    int goblin_count = clampi(room_count + rand() % 4, 4, MAX_ACTORS - actor_count - 1);
-    for (int i = 0; i < goblin_count; i++) {
+    /* Enemy count is a fixed range, NOT scaled by room_count: room
+     * generation nearly always hits MAX_ROOMS, so scaling by it would
+     * make every dungeon equally crowded. */
+    int enemy_count = clampi(room_count / 2 + rand() % 3, 4, 12);
+    for (int i = 0; i < enemy_count; i++) {
         int ridx = 1 + rand() % (room_count - 1);
         int x, y;
         free_spot_in_room(ridx, &x, &y);
-        if (!get_actor_at(x, y)) spawn_actor(ACTOR_GOBLIN, x, y, 3, 'g', 180, 40, 40, 0);
+        if (get_actor_at(x, y)) continue;
+
+        /* Weighted mix: goblins are the baseline, rats are filler,
+         * bats and skeletons are rarer and dangerous in different ways. */
+        int roll = rand() % 100;
+        if (roll < 40)      spawn_actor(ACTOR_GOBLIN,   x, y, 3, 'g', 180, 40,  40,  0);
+        else if (roll < 70) spawn_actor(ACTOR_RAT,       x, y, 1, 'r', 150, 100, 60,  0);
+        else if (roll < 85) spawn_actor(ACTOR_BAT,       x, y, 2, 'b', 150, 70,  190, 0);
+        else                spawn_actor(ACTOR_SKELETON,  x, y, 5, 's', 210, 210, 200, 0);
     }
 }
 
@@ -284,12 +318,12 @@ void try_move_player(int dx, int dy) {
 
     Actor *target = get_actor_at(nx, ny);
     if (target) {
-        if (target->type == ACTOR_GOBLIN) {
+        if (is_enemy(target->type)) {
             target->hp -= player->power;
             if (target->hp <= 0) {
-                snprintf(message, sizeof(message), "You slew the goblin!");
+                snprintf(message, sizeof(message), "You slew the %s!", enemy_name(target->type));
             } else {
-                snprintf(message, sizeof(message), "You hit the goblin! (%d HP left)", target->hp);
+                snprintf(message, sizeof(message), "You hit the %s! (%d HP left)", enemy_name(target->type), target->hp);
             }
         } else if (target->type == ACTOR_POTION) {
             player->hp = 10;
@@ -315,27 +349,54 @@ void try_move_player(int dx, int dy) {
 }
 
 void enemy_turn(void) {
+    static int turn_counter = 0;
+    turn_counter++;
+
     for (int i = 0; i < actor_count; i++) {
         Actor *a = &actors[i];
-        if (a->type != ACTOR_GOBLIN || a->hp <= 0 || !player) continue;
+        if (!is_enemy(a->type) || a->hp <= 0 || !player) continue;
 
         float dx = (float)(player->x - a->x);
         float dy = (float)(player->y - a->y);
         float dist = sqrtf(dx * dx + dy * dy);
 
-        if (dist > TORCH_RADIUS + 2.0f) continue;
+        /* Aggro stays close to the torch radius so enemies mostly only
+         * react to what you can see. Bats sense a bit farther (flying),
+         * rats only notice you up close. */
+        float aggro = TORCH_RADIUS;
+        if (a->type == ACTOR_BAT) aggro = TORCH_RADIUS + 1.0f;
+        else if (a->type == ACTOR_RAT) aggro = TORCH_RADIUS - 2.0f;
+
+        if (dist > aggro) continue;
 
         if (dist <= 1.5f) {
-            player->hp--;
-            snprintf(message, sizeof(message), "The goblin hits you! (%d HP left)", player->hp);
+            int dmg = (a->type == ACTOR_SKELETON) ? 2 : 1;
+            player->hp -= dmg;
+            snprintf(message, sizeof(message), "The %s hits you! (%d HP left)", enemy_name(a->type), player->hp);
             continue;
         }
 
-        int mx = (dx > 0) ? 1 : (dx < 0 ? -1 : 0);
-        int my = (dy > 0) ? 1 : (dy < 0 ? -1 : 0);
+        /* Skeletons are slow and only act every other turn. */
+        if (a->type == ACTOR_SKELETON && (turn_counter % 2) != 0) continue;
 
-        if (abs((int)dx) > abs((int)dy)) my = 0;
-        else mx = 0;
+        int mx, my;
+        int cmx = (dx > 0) ? 1 : (dx < 0 ? -1 : 0);
+        int cmy = (dy > 0) ? 1 : (dy < 0 ? -1 : 0);
+        if (abs((int)dx) > abs((int)dy)) cmy = 0;
+        else cmx = 0;
+
+        /* Bats fly erratically most of the time; rats are skittish and
+         * sometimes bolt in a random direction instead of chasing. */
+        int erratic_chance = 0;
+        if (a->type == ACTOR_BAT) erratic_chance = 70;
+        else if (a->type == ACTOR_RAT) erratic_chance = 40;
+
+        if (erratic_chance > 0 && (rand() % 100) < erratic_chance) {
+            random_cardinal(&mx, &my);
+        } else {
+            mx = cmx;
+            my = cmy;
+        }
 
         int nx = a->x + mx;
         int ny = a->y + my;
