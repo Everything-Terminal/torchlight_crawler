@@ -53,6 +53,9 @@ typedef struct {
 static struct termios orig_termios;
 static volatile int running = 1;
 static char message[128] = "Find the Amulet of Yendor...";
+/* Run stats, shown on the end screen */
+static int stat_kills = 0;
+static int stat_turns = 0;
 
 static void disable_raw_mode(void) {
     tcsetattr(STDIN_FILENO, TCSAFLUSH, &orig_termios);
@@ -220,6 +223,14 @@ Actor* get_actor_at(int x, int y) {
     return NULL;
 }
 
+/* True once the amulet has been picked up (no living amulet left) */
+static int amulet_taken(void) {
+    for (int i = 0; i < actor_count; i++) {
+        if (actors[i].type == ACTOR_AMULET && actors[i].hp > 0) return 0;
+    }
+    return 1;
+}
+
 static Actor* spawn_actor(ActorType type, int x, int y, int hp, char ch, int r, int g, int b, int power) {
     if (actor_count >= MAX_ACTORS) return NULL;
     Actor *a = &actors[actor_count++];
@@ -321,6 +332,7 @@ void try_move_player(int dx, int dy) {
         if (is_enemy(target->type)) {
             target->hp -= player->power;
             if (target->hp <= 0) {
+                stat_kills++;
                 snprintf(message, sizeof(message), "You slew the %s!", enemy_name(target->type));
             } else {
                 snprintf(message, sizeof(message), "You hit the %s! (%d HP left)", enemy_name(target->type), target->hp);
@@ -519,6 +531,69 @@ void render(void) {
     fflush(stdout);
 }
 
+/* End screens */
+
+/* Prints one boxed line, test must be plain ASCII so %-36s pads correctly. */
+static void end_line(int r, int g, int b, const char *text) {
+    printf("   \033[38;2;%d;%d;%dm║\033[0m %-36s \033[38;2;%d;%d;%dm║\033[0m\n",
+           r, g, b, text, r, g, b);
+}
+
+static void end_line_centered(int r, int g, int b, const char *text) {
+    char line[64];
+    int pad = (36 - (int)strlen(text)) / 2;
+    if (pad < 0) pad = 0;
+    snprintf(line, sizeof(line), "%*s%s", pad, "", text);
+    end_line(r, g, b, line);
+}
+
+static void show_end_screen(int won) {
+    /* Gold for a win, dark red for a death */
+    int r = won ? 255 : 200;
+    int g = won ? 210 : 50;
+    int b = won ? 90  : 50;
+    char line[64];
+
+    printf("\033[2J\033[H\n\n");
+    printf("   \033[38;2;%d;%d;%dm╔══════════════════════════════════════╗\033[0m\n", r, g, b);
+    end_line(r, g, b, "");
+    {
+        const char *title = won ? "YOU FOUND THE AMULET!" : "YOU DIED IN THE DARK";
+        int pad = (36 - (int)strlen(title)) / 2;
+        printf("   \033[38;2;%d;%d;%dm║\033[1m %*s%-*s \033[0m\033[38;2;%d;%d;%dm║\033[0m\n",
+               r, g, b, pad, "", 36 - pad, title, r, g, b);
+    }
+    end_line_centered(180, 180, 190, won ? "The Amulet of Yendor is yours." : "The torch flickers out...");
+    end_line(r, g, b, "");
+
+    snprintf(line, sizeof(line), "Enemies slain: %d", stat_kills);
+    end_line(200, 200, 210, line);
+    snprintf(line, sizeof(line), "Turns taken:   %d", stat_turns);
+    end_line(200, 200, 210, line);
+    snprintf(line, sizeof(line), "Weapon:        %s (%d dmg)",
+             weapon_name_for_power(player->power), player->power);
+    end_line(200, 200, 210, line);
+    if (won) {
+        snprintf(line, sizeof(line), "HP remaining:  %d/10", player->hp);
+        end_line(200, 200, 210, line);
+    }
+
+    end_line(r, g, b, "");
+    end_line_centered(120, 120, 130, "Press any key to exit");
+    printf("   \033[38;2;%d;%d;%dm╚══════════════════════════════════════╝\033[0m\n", r, g, b);
+    fflush(stdout);
+}
+
+/* Blocks until a key is pressed (or CTRL+C). Flushes pending input first
+ * so a key held down during the final moment doesn't skip the screen. */
+static void wait_for_key(void) {
+    tcflush(STDIN_FILENO, TCIFLUSH);
+    char c;
+    while (running) {
+        if (read(STDIN_FILENO, &c, 1) == 1) break;
+    }
+}
+
 /* Main */
 
 int main(void) {
@@ -533,6 +608,8 @@ int main(void) {
     printf("\033[2J");
 
     init_game();
+
+    enum { OUTCOME_QUIT, OUTCOME_WON, OUTCOME_DIED } outcome = OUTCOME_QUIT;
 
     while (running && player && player->hp > 0) {
         render();
@@ -560,8 +637,9 @@ int main(void) {
             }
 
             if (dx != 0 || dy != 0) {
+                stat_turns++;
                 try_move_player(dx, dy);
-                if (player->hp > 0) {
+                if (player->hp > 0 && !amulet_taken()) {
                     enemy_turn();
                 }
             }
@@ -570,22 +648,22 @@ int main(void) {
         if (player && player->hp <= 0) {
             snprintf(message, sizeof(message), "You died in the dark...");
             render();
-            sleep(2);
+            usleep(900000);
+            outcome = OUTCOME_DIED;
             break;
         }
 
-        int amulet_gone = 1;
-        for (int i = 0; i < actor_count; i++) {
-            if (actors[i].type == ACTOR_AMULET && actors[i].hp > 0) {
-                amulet_gone = 0;
-                break;
-            }
-        }
-        if (amulet_gone) {
+        if (amulet_taken()) {
             render();
-            sleep(2);
+            usleep(900000);
+            outcome = OUTCOME_WON;
             break;
         }
+    }
+
+    if (outcome != OUTCOME_QUIT) {
+        show_end_screen(outcome == OUTCOME_WON);
+        wait_for_key();
     }
 
     printf("\033[2J\033[H\033[?25h");
